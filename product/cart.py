@@ -1,109 +1,90 @@
+from decimal import Decimal
+from django.core.exceptions import ValidationError
 from .models import Product
-class Cart() :
-    def __init__(self,request):
+
+
+class Cart():
+    def __init__(self, request):
         self.session = request.session
-        cart = self.session.get('session_key')
+        self.cart = self.session.setdefault('session_key', {})
+        # Keep carts from the old product-id format usable.
+        for key, item in list(self.cart.items()):
+            if ':' not in key:
+                self.cart.pop(key)
+                self.save()
+                try:
+                    product = Product.objects.get(pk=key)
+                    sizes = list(product.size.all())
+                    selected = next((s for s in sizes if str(item.get('size')) in
+                                     (str(s.pk), str(s), 'Size ' + str(s))), None)
+                    if sizes and selected is None:
+                        continue
+                    size_id = str(selected.pk) if selected else ''
+                    self.cart[f'{product.pk}:{size_id}'] = {
+                        'product_id': product.pk, 'size': size_id,
+                        'quantity': max(1, int(item['quantity']))}
+                except (Product.DoesNotExist, ValueError, TypeError, KeyError):
+                    pass
+                self.save()
 
-        if 'session_key' not in request.session:
-            cart = self.session['session_key'] = {}
-
-        self.cart = cart    # bara motmaen shodan inke dar hame app ha kar mikonad
-
-     #------------------------------------------------------------------------------------
-    def add (self,id,size,tedad):
-        product_id = str(id)
-        product_quantity = tedad
-        product_size = str(size)
-
-        if product_id in self.cart.keys():
-            self.cart[product_id]['quantity'] += product_quantity
-        else :
-            self.cart[product_id] = {'quantity': product_quantity,'size': product_size}
-
-#####################    در حال تست 
-        # if product_code in self.cart.keys():
-        #     if size is  None :
-        #         self.cart[product_code]['quantity'] += product_quantity
-        #     else :
-        #         if self.cart[product_code]['size'].value() == size :
-        #             self.cart[product_code]['quantity'] += product_quantity
-
-
-        # else :
-        #     if size is None:
-        #         self.cart[product_code] = {'quantity': product_quantity,'model': product_model}
-        #     else :
-        #         self.cart[product_code] = {'quantity': product_quantity,'model': product_model ,'size': size}  
-##################      
-
-        print(self.cart.items())
+    def save(self):
         self.session.modified = True
 
-    #     #------------------------------------------------------------------------------------
-    # def cart_total (self) :
-    #     quantities = self.cart
-    #     product_ids = self.cart.keys()
-        
-    #     man = manto.objects.filter(product_code__in=product_ids)
-    #     shal = shal_or_rosari.objects.filter(product_code__in=product_ids)
-    #     products = list(man) + list(shal)
-    #     total = 0 
-    #     for key , value in quantities.items():
-    #         key = int(key)
-    #         for product in products :
-    #             if product.product_code == key :
-    #                 total += (product.price *  value.get('quantity'))
-    #     return total
-            
-    #  #------------------------------------------------------------------------------------
+    def add(self, id, size, tedad, replace=False):
+        product = Product.objects.get(pk=id)
+        try:
+            quantity = int(tedad)
+        except (ValueError, TypeError):
+            raise ValidationError('تعداد باید عدد صحیح باشد.')
+        if quantity < 1:
+            raise ValidationError('تعداد باید حداقل یک باشد.')
+        stocks = {str(stock.size_id): stock for stock in product.size_stocks.all()}
+        selected = str(size or '')
+        if stocks and selected not in stocks:
+            raise ValidationError('سایز معتبر محصول را انتخاب کنید.')
+        if not stocks and selected:
+            raise ValidationError('این محصول سایز انتخابی ندارد.')
+        key = f'{product.pk}:{selected}'
+        current = self.cart.get(key, {}).get('quantity', 0)
+        quantity = quantity if replace else current + quantity
+        available = stocks[selected].quantity if stocks else product.quantity
+        if quantity > available:
+            raise ValidationError('تعداد درخواستی بیشتر از موجودی سایز یا محصول انتخاب‌شده است.')
+        self.cart[key] = {'product_id': product.pk, 'size': selected, 'quantity': quantity}
+        self.save()
 
+    def __iter__(self):
+        products = {p.pk: p for p in self.get_products()}
+        for key, item in list(self.cart.items()):
+            product = products.get(item['product_id'])
+            if product is None:
+                self.delete(key)
+                continue
+            stocks = {str(stock.size_id): stock for stock in product.size_stocks.all()}
+            stock = stocks.get(item['size'])
+            valid = stock is not None if stocks else not item['size']
+            available = stock.quantity if stock else (0 if item['size'] or stocks else product.quantity)
+            yield {**item, 'key': key, 'product': product,
+                   'size_name': str(stock.size) if stock else ('سایز حذف‌شده' if item['size'] else 'بدون سایز'),
+                   'available': available,
+                   'valid': valid and item['quantity'] <= available,
+                   'price': product.final_price,
+                   'total': product.final_price * item['quantity']}
 
-    def __len__ (self):
-        return len(self.cart)
-    #  #------------------------------------------------------------------------------------
-    
-    # def get_products (self):
-    #     product_ids = self.cart
-    
-    #     items_shal = {}
-    #     items_manto = {}
-    #     for key, value in product_ids.items():
-    #         if value.get('model') == 'manto':
-    #             items_manto[key] = value
-    #         manto_object = items_manto.keys()
+    def __len__(self):
+        return sum(item['quantity'] for item in self)
 
-    #         if value.get('model') == 'shal_or_rosari':
-    #             items_shal[key] = value
+    def get_products(self):
+        ids = [item['product_id'] for item in self.cart.values()]
+        return Product.objects.filter(pk__in=ids).prefetch_related('size_stocks__size')
 
-    #     products_manto = manto.objects.filter(product_code__in = items_manto.keys())
-    #     products_shal = shal_or_rosari.objects.filter(product_code__in = items_shal.keys())
-    #     pro = list(products_manto)+list(products_shal)
+    def cart_total(self):
+        return sum((item['total'] for item in self), Decimal('0'))
 
-    #     return pro
-    def get_products (self):
-        products_ids = self.cart.keys()
-        products = Product.objects.filter(id__in=products_ids)
-        return products
-        
-    #  #------------------------------------------------------------------------------------
+    def delete(self, key):
+        self.cart.pop(key, None)
+        self.save()
 
-    # def get_quants (self) :
-    #     quantities = self.cart
-    #     return quantities
-    #  #------------------------------------------------------------------------------------
-
-    # def delete (self, product_code) :
-    #     product_code = str(product_code)
-        
-    #     if product_code in self.cart :
-    #         del self.cart[product_code]
-    #     self.session.modified = True
-        
-    #  #------------------------------------------------------------------------------------
-    # def delete_all (self) :
-    #     del self.cart
-    #     self.session.modified = True
-        
-
-    # def items (self):
-    #     return self.cart.keys()
+    def delete_all(self):
+        self.cart.clear()
+        self.save()
